@@ -417,6 +417,38 @@ vtcon1 name=(M) frame buffer device   ← 真正画到屏幕的，要解这个
 
 解绑后内核会打印 `Console: switching to colour dummy device 80x30`（正常现象），console 输出照常在串口 `ttymxc0`。
 
+### 9.4 HDMI：同源镜像 + 插上就改分辨率
+
+这块板确实有 HDMI，但不是独立显示通道：SoC（i.MX6ULL）没有 HDMI 控制器，底板上是一颗 **sii902x 发射芯片**（挂在 I2C1 的 0x39），把 **LCDIF 的并行 RGB 信号原样转成 HDMI**。它绑定的是**fb0**（`/sys/bus/i2c/devices/1-0039/fb_name` = `mxs-lcdif`）——所以 **HDMI 屏上显示的就是 fb0 的内容，和 LCD 完全同源**，不需要也不存在"第二块 framebuffer"（fb1 只是同一控制器的备用图层）。
+
+**坑：插入 HDMI 会把 fb0 的分辨率改掉。** 驱动（`drivers/video/fbdev/mxc/mxsfb_sii902x.c` 的 `sii902x_cable_connected()`）检测到插入后会读电视 EDID，然后直接 `fb_set_var()` 改 fb0——实测从 `1024x600/32bpp` 被改成 **`1280x720/16bpp`**。不处理的话 ffmpeg 还按旧参数输出，轻则画面错位，重则因为像素格式不匹配**一帧都写不进去**（进程还在跑，看似活着）。
+
+播放器的对策（主循环里每 2 秒查一次）：
+
+```c
+/* /sys/.../1-0039/cable_state = plugin / plugout */
+fb_size_now(&w, &h);
+if (w != g_w || h != g_h) {          /* 分辨率被驱动改了 */
+    g_w = g_h = 0;
+    detect_fb();                      /* 重新读尺寸+位深, 换像素格式 */
+    play(g_cur);                      /* 用新参数重开 ffmpeg */
+}
+```
+
+实测数据：插上 HDMI 后（1280x720 + rgb565le），同一个源从 **11 FPS 降到 9.1 FPS**——分辨率多了 31% 像素，还被切到了优化较差的 rgb565 路径。HDMI 上的实拍画面：
+
+![HDMI 输出](docs/images/07-hdmi.jpg)
+
+排障口诀：
+
+```bash
+cat /sys/bus/i2c/devices/1-0039/cable_state   # plugin / plugout
+cat /sys/class/graphics/fb0/virtual_size      # 被改成多少了
+grep SII902x_det /proc/interrupts             # 插拔一次计数 +1 说明中断正常
+```
+
+注意触摸量程仍是 LCD 的物理分辨率（x[0,1024]），坐标是按比例映射的，插拔 HDMI 不影响点击判定。
+
 ---
 
 ## 10. ffmpeg 命令是怎么拼出来的
@@ -642,6 +674,7 @@ CPU 占用高不代表卡——它意味着"尽力跑满"，实际帧率上限�
 | 13 | 改完代码板子上没变化 | 播放器还在跑，日志打断 ZMODEM 传输，push 静默失败 | 部署后**一定要对比 md5**（`md5sum /root/03_iptv` vs 本地） |
 | 14 | 开机动画被跳过后**立刻换台** | 跳过时的输入事件还留在队列里 | 跳过时必须把事件 `read` 出来丢掉 |
 | 15 | 串口 base64 传回的**图片打不开** | 115200 下 CPU 一忙就丢字符 | 收完检查 `FF D9` 结尾；有网就优先 scp |
+| 16 | 插上 HDMI 后**画面错位/没画面** | 驱动读电视 EDID 后把 fb0 从 1024x600/32bpp 改成 1280x720/16bpp，播放器还按旧参数输出 | 主循环每 2 秒查分辨率，变了就重探参数并重开 ffmpeg（见 §9.4） |
 | 16 | rtmp/rtsp 源**一启动就退出** | 命令里带了 `-framedrop`，这个 ffmpeg 4.2.3 没编该选项 | 删掉；丢帧保实时用 `IPTV_FPS` 限帧实现 |
 | 17 | 加了 `-threads 1` 反而**更卡** | 单核上多线程能让解码与缩放/写屏流水重叠 | 不设 threads，让 ffmpeg 自己决定 |
 | 18 | 想**省写屏带宽**切 16bpp，结果更慢 | rgb565 转换路径没有 bgra 优化得好 | 保持 32bpp/bgra |

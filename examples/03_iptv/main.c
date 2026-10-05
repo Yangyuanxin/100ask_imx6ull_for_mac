@@ -187,6 +187,46 @@ static void detect_fb(void)
     fflush(stdout);
 }
 
+/*
+ * HDMI 输出状态。
+ *
+ * 这块板的 HDMI 是 sii902x 发射芯片, 它把 LCDIF 的并行 RGB 信号转成 HDMI,
+ * 用的就是同一个 fb0 —— 所以 HDMI 屏上看到的就是 fb0 的内容, 和 LCD 完全同源,
+ * 不需要(也没办法)往第二块 framebuffer 再写一份, 插上就有画面。
+ *
+ * 但有个坑: 内核驱动检测到插入后会读电视 EDID, 再 fb_set_var() 改掉 fb0 的
+ * 分辨率(见 drivers/video/fbdev/mxc/mxsfb_sii902x.c 的 sii902x_cable_connected)。
+ * 这一改, 我们启动时探测的屏幕尺寸就作废了 —— ffmpeg 还按旧尺寸输出,
+ * 画面会错位, 甚至因为格式/尺寸不匹配直接写不进去(症状是进程在跑但没画面)。
+ * 所以主循环里盯着插拔, 分辨率一变就重新探测 + 重开播放。
+ */
+static int hdmi_cable(void)
+{
+    FILE *fp = fopen("/sys/bus/i2c/devices/1-0039/cable_state", "r");
+    char b[32] = {0};
+
+    if (!fp)
+        return -1;                      /* 板上没有这颗芯片 */
+    if (fgets(b, sizeof(b), fp)) {
+        fclose(fp);
+        return strncmp(b, "plugin", 6) == 0 ? 1 : 0;
+    }
+    fclose(fp);
+    return -1;
+}
+
+static void fb_size_now(int *w, int *h)
+{
+    FILE *fp = fopen("/sys/class/graphics/fb0/virtual_size", "r");
+
+    *w = *h = 0;
+    if (fp) {
+        if (fscanf(fp, "%d,%d", w, h) != 2)
+            *w = *h = 0;
+        fclose(fp);
+    }
+}
+
 /* ------------------------------ ffmpeg 调用 ---------------------------- */
 /*
  * drawtext 的 text 参数里 : \ ' % 都有特殊含义, 需要转义,
@@ -778,6 +818,15 @@ int main(int argc, char **argv)
 
     detect_fb();
 
+    {
+        int c = hdmi_cable();
+        if (c >= 0) {
+            printf("[iptv] HDMI %s\n", c ? "已连接(与 LCD 同源, 同步显示 fb0 内容)"
+                                        : "未连接");
+            fflush(stdout);
+        }
+    }
+
     /*
      * 频道表是空的(刚装好还没加频道)时不要直接退出留个黑屏:
      * 屏幕上给出提示, 然后每隔几秒重读一次频道表,
@@ -838,6 +887,8 @@ int main(int argc, char **argv)
     int last_x = -1, last_y = -1;
 
     time_t last_keep = 0;
+    time_t last_hdmi = 0;
+    int    last_cable = -1;
 
     while (!g_quit) {
         /* 每 10 秒维护一次防黑屏(内核的 consoleblank 可能被重新设回去) */
@@ -845,6 +896,33 @@ int main(int argc, char **argv)
         if (now - last_keep >= 10) {
             last_keep = now;
             keep_screen_on();
+        }
+
+        /*
+         * 每 2 秒看一眼 HDMI: 插上时内核会按电视 EDID 改 fb0 分辨率,
+         * 改了就得重新探测屏幕参数并重开 ffmpeg, 否则画面错位/写不进去。
+         */
+        if (now - last_hdmi >= 2) {
+            int c, w = 0, h = 0;
+
+            last_hdmi = now;
+            c = hdmi_cable();
+            if (c != last_cable) {
+                last_cable = c;
+                if (c >= 0) {
+                    printf("[iptv] HDMI %s\n", c ? "已连接(与 LCD 同源, 同步显示 fb0)"
+                                                : "已拔出");
+                    fflush(stdout);
+                }
+            }
+            fb_size_now(&w, &h);
+            if (w > 0 && h > 0 && (w != g_w || h != g_h)) {
+                printf("[iptv] 屏幕变成 %dx%d (原 %dx%d), 重新适配\n", w, h, g_w, g_h);
+                fflush(stdout);
+                g_w = g_h = 0;      /* detect_fb() 只在为 0 时才重新测 */
+                detect_fb();
+                play(g_cur);
+            }
         }
 
         /* 外部控制: kill -USR1/USR2/HUP <pid> = 下一台/上一台/频道列表 */
