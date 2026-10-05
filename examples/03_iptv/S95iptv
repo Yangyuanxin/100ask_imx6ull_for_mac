@@ -22,6 +22,12 @@ case "$1" in
 start)
     # 后台跑, start 立即返回, 绝不阻塞 init
     (
+        # CPU 锁到最高频。默认 ondemand 策略实测经常赖在 198MHz / 528MHz
+        # (可选 198/396/528/792), 而解码 + 缩放是持续满载的活, 调度器来不及升频。
+        # 锁 792MHz 是白捡的性能 —— 对性能的影响比任何参数调整都大。
+        echo "iptv: CPU 锁最高频 ..."
+        echo performance > /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor 2>/dev/null
+
         echo "iptv: 关掉板厂 HMI(它会跟电视抢屏幕) ..."
         /etc/init.d/S99myirhmi2 stop 2>/dev/null
         killall -9 myirhmi2 2>/dev/null

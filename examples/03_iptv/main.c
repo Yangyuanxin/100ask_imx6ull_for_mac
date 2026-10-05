@@ -250,14 +250,51 @@ static void play(int idx)
     g_cur = idx;
     g_menu = 0;
 
-    char osd[1536], name[512];
+    char osd[1536], name[512], scalef[256], fpsbuf[32];
     esc_text(name, sizeof(name), g_ch[idx].name);
+
+    /*
+     * 缩放策略 —— 这才是这块板的性能瓶颈所在。
+     * 实测(792MHz, 640x360 的源, 端到端真写屏幕):
+     *     放大到 1024x600 满屏 ....... 11 FPS, CPU 92%
+     *     放大到 800x450 ............. 14 FPS, CPU 79%
+     *     不放大(1:1, 四周补黑边) .... 22 FPS  ← 差一倍
+     * 而纯解码(不缩放不写屏)能到 47 FPS, 说明解码根本不是瓶颈,
+     * 贵的是 swscale 的插值和每帧 2.4MB 的 framebuffer 写入。
+     *   IPTV_SCALE=native (默认) 不放大: 最快, 代价是画面不满屏
+     *   IPTV_SCALE=fit           最多 0.78 屏宽: 折中
+     *   IPTV_SCALE=full          放大到满屏: 画面最好, 但只有 11 FPS
+     * 表达式用 min(iw, X) 是为了两头都照顾: 比屏幕小的源不放大,
+     * 比屏幕大的源(720p/1080p)照样缩到屏幕内。
+     */
+    const char *sm = getenv("IPTV_SCALE");
+    if (sm && strncmp(sm, "full", 4) == 0) {
+        snprintf(scalef, sizeof(scalef),
+                 "scale=%d:%d:force_original_aspect_ratio=decrease", g_w, g_h);
+    } else {
+        int maxw = (sm && strncmp(sm, "fit", 3) == 0) ? (g_w * 78 / 100) : g_w;
+        snprintf(scalef, sizeof(scalef), "scale=w='min(iw\\,%d)':h=-2", maxw);
+    }
+
+    /*
+     * IPTV_FPS=N: 限制输出帧率。CPU 跑满(90%+)时帧间隔会抖, 而且一忙
+     * 直播间延迟会越积越大; 限帧能留出余量、画面更稳也更凉快。默认不限。
+     * fps 滤镜故意放在最前面 —— 先丢帧, 后面的缩放就不必为丢掉的帧白干活。
+     */
+    fpsbuf[0] = '\0';
+    const char *fe = getenv("IPTV_FPS");
+    if (fe) {
+        int fps = atoi(fe);
+        if (fps > 0 && fps < 60)
+            snprintf(fpsbuf, sizeof(fpsbuf), "fps=%d,", fps);
+    }
+
     snprintf(osd, sizeof(osd),
-             "scale=%d:%d:force_original_aspect_ratio=decrease,"
+             "%s%s,"
              "pad=%d:%d:(ow-iw)/2:(oh-ih)/2:color=black,"
              "drawtext=fontfile=%s:text='%s':x=36:y=28:fontsize=34:"
              "fontcolor=white:shadowcolor=black:shadowx=2:shadowy=2:enable='lt(t\\,8)'",
-             g_w, g_h, g_w, g_h, g_font, name);
+             fpsbuf, scalef, g_w, g_h, g_font, name);
 
     /*
      * 低延迟那几个参数(nobuffer / 很小的 analyzeduration)实测会让起播失败:
@@ -278,12 +315,21 @@ static void play(int idx)
     argv[i++] = (char *)"warning";
     argv[i++] = (char *)"-rw_timeout";
     argv[i++] = (char *)"15000000";     /* 15s 读不到数据就退出, 由本程序重连 */
+    /*
+     * 别加 -threads 1。直觉上单核应该单线程最快, 实测恰恰相反:
+     * 同样的流, 默认(多线程)19 FPS, 强制单线程只有 14 FPS —— 多线程能让
+     * 解码和后面的缩放/写屏流水重叠起来, 单核照样有收益。
+     */
     if (lowlat) {
         argv[i++] = (char *)"-fflags";
         argv[i++] = (char *)"nobuffer+discardcorrupt";
         argv[i++] = (char *)"-flags";
         argv[i++] = (char *)"low_delay";
-        argv[i++] = (char *)"-framedrop";
+        /*
+         * 以前这里还有一个 -framedrop, 实际上这个 ffmpeg(4.2.3, Buildroot 编的)
+         * 根本没编进这个选项, 结果是 rtmp/rtsp 源一上来就
+         * "Unrecognized option 'framedrop'" 直接起不来。要丢帧保实时用 IPTV_FPS。
+         */
         argv[i++] = (char *)"-probesize";
         argv[i++] = (char *)"500000";
         argv[i++] = (char *)"-analyzeduration";
