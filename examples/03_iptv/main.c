@@ -239,6 +239,61 @@ static int alive(void)
     return g_pid > 0 && kill(g_pid, 0) == 0;
 }
 
+/*
+ * 换台过渡。
+ * 从杀掉上一个 ffmpeg 到新频道第一帧画面出现, 中间有 1~2 秒的空档
+ * (HLS 要重新探测 + 缓冲, 这个延迟没法治), 这段时间屏幕上还留着
+ * 上一频道的最后一帧 —— 用户看到的就是"按了键, 卡住了"。
+ * 所以这里先画一张"正在切换到 XXX"顶上去, 让按键立刻有反馈:
+ * 起播慢这件事改不掉, 但"看得出它在切"和"以为死机了"是两种体验。
+ */
+static void show_switching(int idx)
+{
+    static int first = 1;          /* 开机第一次不叫"切换", 叫"载入" */
+    char vf[2048], name[512], sub[512];
+
+    esc_text(name, sizeof(name), g_ch[idx].name);
+    snprintf(sub, sizeof(sub), "第 %d / %d 个频道", idx + 1, g_nch);
+
+    snprintf(vf, sizeof(vf),
+             "drawtext=fontfile=%s:text='%s':x=(w-text_w)/2:y=%d:fontsize=28:fontcolor=#8899aa,"
+             "drawtext=fontfile=%s:text='%s':x=(w-text_w)/2:y=%d:fontsize=46:fontcolor=white,"
+             "drawtext=fontfile=%s:text='%s':x=(w-text_w)/2:y=%d:fontsize=24:fontcolor=#667788",
+             g_font, first ? "正在载入" : "正在切换", g_h / 2 - 100,
+             g_font, name, g_h / 2 - 40,
+             g_font, sub, g_h / 2 + 40);
+    first = 0;
+
+    char *argv[32];
+    int i = 0;
+    argv[i++] = (char *)"ffmpeg";
+    argv[i++] = (char *)"-nostdin";
+    argv[i++] = (char *)"-loglevel";
+    argv[i++] = (char *)"error";
+    argv[i++] = (char *)"-f";
+    argv[i++] = (char *)"lavfi";
+    argv[i++] = (char *)"-i";
+    argv[i++] = g_bg;
+    argv[i++] = (char *)"-vf";
+    argv[i++] = vf;
+    argv[i++] = (char *)"-frames:v";
+    argv[i++] = (char *)"1";
+    argv[i++] = (char *)"-pix_fmt";
+    argv[i++] = g_pixfmt;
+    argv[i++] = (char *)"-f";
+    argv[i++] = (char *)"fbdev";
+    argv[i++] = (char *)"/dev/fb0";
+    argv[i] = NULL;
+
+    spawn_ffmpeg(argv);
+    /* 等这张图画完再起播放器, 否则两边抢 fb0 */
+    if (g_pid > 0) {
+        int st;
+        waitpid(g_pid, &st, 0);
+        g_pid = -1;
+    }
+}
+
 /* 播放第 idx 个频道, 画面上叠加 8 秒的频道名 OSD */
 static void play(int idx)
 {
@@ -249,6 +304,9 @@ static void play(int idx)
     stop_play();
     g_cur = idx;
     g_menu = 0;
+
+    /* 起播要 1~2 秒, 先给个"正在切换"的反馈, 不然按键像是没反应 */
+    show_switching(idx);
 
     char osd[1536], name[512], scalef[256], fpsbuf[32];
     esc_text(name, sizeof(name), g_ch[idx].name);
@@ -268,12 +326,21 @@ static void play(int idx)
      * 比屏幕大的源(720p/1080p)照样缩到屏幕内。
      */
     const char *sm = getenv("IPTV_SCALE");
-    if (sm && strncmp(sm, "full", 4) == 0) {
+    if (sm && strncmp(sm, "native", 6) == 0) {
+        /* 不放大(1:1 直通): 最快, 但画面只占屏宽 62%, 四周黑边明显 */
+        snprintf(scalef, sizeof(scalef), "scale=w='min(iw\\,%d)':h=-2", g_w);
+    } else if (sm && strncmp(sm, "fit", 3) == 0) {
+        snprintf(scalef, sizeof(scalef), "scale=%d:-2", g_w * 85 / 100);
+    } else {
+        /*
+         * 默认: 放大到满屏。
+         * 实测(本地素材)放大到 85% 屏宽 13 FPS、满屏 12 FPS —— 几乎一样贵,
+         * 说明开销花在"放大"这个动作本身, 跟放大多少关系不大。
+         * 既然代价都要付, 那就直接给满屏: 640x360 的源放大成 1024x576,
+         * 上下只剩 24px, 黑边基本看不见。
+         */
         snprintf(scalef, sizeof(scalef),
                  "scale=%d:%d:force_original_aspect_ratio=decrease", g_w, g_h);
-    } else {
-        int maxw = (sm && strncmp(sm, "fit", 3) == 0) ? (g_w * 78 / 100) : g_w;
-        snprintf(scalef, sizeof(scalef), "scale=w='min(iw\\,%d)':h=-2", maxw);
     }
 
     /*
