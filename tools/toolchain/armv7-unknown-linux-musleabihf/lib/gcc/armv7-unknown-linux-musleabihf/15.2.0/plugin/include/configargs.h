@@ -1,0 +1,7 @@
+/* Generated automatically. */
+static const char configuration_arguments[] = "/Volumes/build/.build/armv7-unknown-linux-musleabihf/src/gcc/configure --build=aarch64-build_apple-darwin23.6.0 --host=aarch64-build_apple-darwin23.6.0 --target=armv7-unknown-linux-musleabihf --prefix=/Volumes/tools/armv7-unknown-linux-musleabihf --exec_prefix=/Volumes/tools/armv7-unknown-linux-musleabihf --with-sysroot=/Volumes/tools/armv7-unknown-linux-musleabihf/armv7-unknown-linux-musleabihf/sysroot --enable-languages=c,c++,fortran --with-fpu=neon-vfpv4 --with-float=hard --enable-__cxa_atexit --disable-libmudflap --enable-libgomp --enable-libssp --enable-libquadmath --enable-libquadmath-support --disable-libsanitizer --disable-libmpx --with-gmp=/Volumes/build/.build/armv7-unknown-linux-musleabihf/buildtools --with-mpfr=/Volumes/build/.build/armv7-unknown-linux-musleabihf/buildtools --with-mpc=/Volumes/build/.build/armv7-unknown-linux-musleabihf/buildtools --with-isl=/Volumes/build/.build/armv7-unknown-linux-musleabihf/buildtools --enable-lto --enable-threads=posix --enable-target-optspace --enable-linker-build-id --enable-plugin --disable-nls --with-system-zlib --disable-multilib --with-local-prefix=/Volumes/tools/armv7-unknown-linux-musleabihf/armv7-unknown-linux-musleabihf/sysroot --enable-long-long";
+static const char thread_model[] = "posix";
+
+static const struct {
+  const char *name, *value;
+} configure_default_options[] = { { "cpu", "arm10e" }, { "float", "hard" }, { "fpu", "neon-vfpv4" }, { "tls", "gnu" } };
