@@ -76,11 +76,76 @@ def send_cmd(s, cmd, wait=1.0, timeout=20.0):
     return buf.decode("utf-8", "replace")
 
 
+# 命令执行完毕的哨兵: 命令后面追加 echo MARKER, 读到它才认为命令真正结束。
+# 这样中间有几秒静默的长命令(比如 udhcpc 重试)也能拿全输出。
+MARKER = "__IMX_DONE__"
+
+
+def send_until_marker(s, cmd, timeout=30.0):
+    # 注意: 不能用 echo __IMX_DONE__ —— 命令行回显里就含这个字符串, 会立刻误判结束。
+    # 拆成两段拼接, 回显里带引号不匹配, 只有真正执行输出才匹配。
+    drain(s, 0.1)
+    s.write(cmd.encode() + b'; echo "__IMX_""DONE__"\n')
+    buf = b""
+    start = time.time()
+    while True:
+        n = s.in_waiting
+        if n:
+            buf += s.read(n)
+            if MARKER.encode() in buf:
+                time.sleep(0.2)
+                buf += s.read(s.in_waiting)
+                break
+        else:
+            time.sleep(0.05)
+        if time.time() - start > timeout:
+            note = "\n[!] 命令未在 %.0f 秒内结束(可能仍在运行), 已返回部分输出\n" % timeout
+            buf += note.encode()
+            break
+    return buf.decode("utf-8", "replace")
+
+
 def enter_shell(s):
-    """敲回车确保进入 shell (板子上电直接是 root shell)"""
+    """
+    确保拿到一个可用的 shell 提示符。
+
+    两件事:
+     1) 串口会被反复开闭, 上一次命令的残留输出常常留在缓冲区里,
+        要多轮读干净, 否则会把上一条命令的输出混进本次结果。
+     2) 重启后串口上跑的是 getty, 会停在 "100ask login:" 等着输用户名
+        (用户名 root, 密码为空)。不先登录的话, 后面发的命令都会被
+        当成用户名吃掉, 表现就是"命令有回显但从不执行"。
+    """
+    for _ in range(2):
+        s.write(b"\n")
+        time.sleep(0.5)
+        buf = b""
+        for _i in range(4):
+            buf += drain(s, 0.12)
+            time.sleep(0.1)
+        buf += drain(s, 0.12)
+        low = buf.lower()
+        if b"login:" in low:
+            s.write(b"root\n")          # 用户名
+            time.sleep(0.8)
+            out = drain(s, 0.15)
+            if b"assword" in out.lower():
+                s.write(b"\n")          # root 密码为空
+                time.sleep(0.8)
+                drain(s, 0.15)
+        if PROMPT.encode() in drain_probe(s):
+            return
+    # 兜底: 再敲一次回车读干净
     s.write(b"\n")
     time.sleep(0.3)
-    drain(s, 0.1)
+    drain(s, 0.12)
+
+
+def drain_probe(s):
+    """探测当前是否已经在 shell 提示符上(发一个空命令看回显)"""
+    s.write(b"\n")
+    time.sleep(0.4)
+    return drain(s, 0.12)
 
 
 def clean(text):
@@ -114,7 +179,8 @@ def cmd_probe(args):
 def cmd_run_cmd(args):
     s = open_port(args.port, args.baud)
     enter_shell(s)
-    print(clean(send_cmd(s, args.command, wait=args.wait)).strip())
+    out = send_until_marker(s, args.command, timeout=args.timeout)
+    print(clean(out.split(MARKER)[0]).strip())
     s.close()
 
 
@@ -240,7 +306,8 @@ def main():
 
     c = sub.add_parser("cmd", help="执行一条命令")
     c.add_argument("command")
-    c.add_argument("-w", "--wait", type=float, default=1.0)
+    c.add_argument("-w", "--wait", type=float, default=1.0, help="最短等待秒数")
+    c.add_argument("-t", "--timeout", type=float, default=20.0, help="最长等待秒数")
     c.set_defaults(func=cmd_run_cmd)
 
     sub.add_parser("monitor", help="交互式串口终端").set_defaults(func=cmd_monitor)

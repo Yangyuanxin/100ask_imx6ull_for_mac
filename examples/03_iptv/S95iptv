@@ -1,0 +1,132 @@
+#!/bin/sh
+#
+# 03_iptv 开机自启动脚本(放到板子 /etc/init.d/S95iptv)
+#
+# ⚠️ 最重要的一条: 整个流程必须放后台运行。
+#   busybox init 是串行跑 /etc/init.d/S* 的, 而串口上的 getty(登录 shell)
+#   要等 rcS 全部跑完才 respawn。之前把网络/对时放在前台,
+#   ntpd 没网时一直卡着, 结果 init 被堵死 -> 串口永远等不到 shell,
+#   表现就是"板子卡住敲命令没反应"。
+#
+# 这块板子实测到的另外两个坑:
+#  1) RTL8723BU 驱动会进 "nolinked power save", 而且 wlan0 的 carrier 恒为 0
+#     (数据帧发不出去), 必须重新 modprobe 并用 wlan1。
+#  2) 没有 RTC 电池, 每次上电时间回到 1970, https 证书会报
+#     "certificate is not yet valid", 联网后必须先 NTP 对时。
+#
+CONF=/etc/iptv/channels.conf
+CERT=/etc/ssl/certs/ca-certificates.crt
+LOG=/var/log/iptv-init.log
+
+case "$1" in
+start)
+    # 后台跑, start 立即返回, 绝不阻塞 init
+    (
+        echo "iptv: 关掉板厂 HMI(它会跟电视抢屏幕) ..."
+        /etc/init.d/S99myirhmi2 stop 2>/dev/null
+        killall -9 myirhmi2 2>/dev/null
+
+        # 防自动休眠黑屏: 内核默认 consoleblank=600(console 空闲 10 分钟就黑屏)。
+        # 背光本身没问题(bl_power=0), 所以这里关的是 framebuffer 的 blank 定时器。
+        # 播放器起来后还会每 10 秒再维护一次, 防止被别的东西重设回去。
+        # 注意: /sys/module/kernel/parameters/consoleblank 在这块板是只读的, 写不进去。
+        # 走 tty 转义序列(等价于 setterm -blank 0): ESC[9;0] = 永不自动黑屏。
+        echo "iptv: 关闭自动黑屏 ..."
+        printf '\033[9;0]' > /dev/tty1 2>/dev/null
+        echo 0 > /sys/class/graphics/fb0/blank 2>/dev/null
+
+        # 干掉屏幕上闪烁的光标, 并把 framebuffer console 从 fb0 解绑。
+        # 不解绑的话 fbcon 会跟 ffmpeg 抢同一块显存: 光标是它画的,
+        # 内核 printk / 登录提示也会直接叠在视频上。
+        # 注意解的是 vtcon1(真正的 frame buffer device), vtcon0 是 dummy。
+        echo "iptv: 关闭 console 光标 ..."
+        echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null
+        echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null
+
+        # 开机第一帧: 联网 + 对时要花几十秒, 这期间别让用户对着黑屏。
+        # 这里先画一张"正在启动"静态图(ffmpeg 一瞬间就画完),
+        # 播放器起来后会接上真正的开机动画。
+        echo "iptv: 画开机启动画面 ..."
+        BPP=$(cat /sys/class/graphics/fb0/bits_per_pixel 2>/dev/null)
+        SIZE=$(cat /sys/class/graphics/fb0/virtual_size 2>/dev/null | tr ',' 'x')
+        [ -z "$SIZE" ] && SIZE=1024x600
+        if [ "$BPP" = "16" ]; then PF=rgb565le; else PF=bgra; fi
+        ffmpeg -nostdin -loglevel error -f lavfi -i "color=c=0x0a1a3a:s=$SIZE" \
+            -vf "drawtext=fontfile=/usr/share/fonts/ttf/msyh.ttc:text='正在启动...':x=(w-text_w)/2:y=(h-text_h)/2:fontsize=44:fontcolor=white" \
+            -frames:v 1 -pix_fmt $PF -f fbdev /dev/fb0 2>/dev/null
+
+        # 系统自带的 NetworkManager 会跟我们手动起的 wpa_supplicant 抢 wlan1,
+        # 实测开着它时 wlan1 一直是 "Not connected", 必须先停掉。
+        echo "iptv: 停掉 NetworkManager ..."
+        /etc/init.d/S89_network_manager stop 2>/dev/null
+        killall -9 NetworkManager 2>/dev/null
+
+        echo "iptv: 重新加载 WiFi 驱动(关省电) ..."
+        ifconfig wlan0 down 2>/dev/null
+        ifconfig wlan1 down 2>/dev/null
+        killall wpa_supplicant 2>/dev/null
+        killall udhcpc 2>/dev/null
+        sleep 1
+        rmmod 8723bu 2>/dev/null
+        sleep 1
+        modprobe 8723bu rtw_power_mgnt=0 rtw_ips_mode=0 2>/dev/null
+        sleep 3
+
+        echo "iptv: 连接 WiFi(wlan1) ..."
+        ifconfig wlan1 up
+        wpa_supplicant -B -i wlan1 -c /etc/wpa_supplicant.conf
+
+        # 等关联成功, 最多 40 秒; 每 12 秒还没连上就重启一次 wpa_supplicant
+        i=0
+        while [ $i -lt 40 ]; do
+            iw dev wlan1 link 2>/dev/null | grep -q Connected && break
+            if [ $((i % 12)) -eq 11 ]; then
+                echo "iptv: 仍未关联, 重启 wpa_supplicant ..."
+                killall wpa_supplicant 2>/dev/null
+                sleep 1
+                wpa_supplicant -B -i wlan1 -c /etc/wpa_supplicant.conf
+            fi
+            sleep 1
+            i=$((i + 1))
+        done
+
+        # 只起一个 udhcpc 在后台重试(-t 0 = 一直重试), 然后轮询 IP, 最多 60 秒
+        killall udhcpc 2>/dev/null
+        udhcpc -i wlan1 -b -t 0 -T 3 >/dev/null 2>&1 &
+        IP=""
+        i=0
+        while [ $i -lt 30 ]; do
+            IP=$(ifconfig wlan1 2>/dev/null | sed -n 's/.*inet addr:\([0-9.]*\).*/\1/p')
+            [ -n "$IP" ] && break
+            sleep 2
+            i=$((i + 1))
+        done
+        echo "iptv: wlan1 IP = ${IP:-无}"
+
+        # NTP 对时。注意: 这块板上 busybox 的 "ntpd -q -n" 只监听不同步,
+        # 实测 ntpdate 才真的把时间设上去。-t 5 保证没网时最多等几秒。
+        for srv in 120.25.115.20 210.72.145.44; do
+            ntpdate -u -t 5 "$srv" >/dev/null 2>&1 && break
+        done
+        hwclock -w 2>/dev/null
+        echo "iptv: 当前时间 = $(date)"
+
+        echo "iptv: 启动播放器 ..."
+        SSL_CERT_FILE=$CERT /root/03_iptv -c $CONF
+    ) > $LOG 2>&1 &
+    ;;
+stop)
+    killall 03_iptv 2>/dev/null
+    killall ffmpeg 2>/dev/null
+    ;;
+restart)
+    $0 stop
+    sleep 2
+    $0 start
+    ;;
+*)
+    echo "Usage: $0 {start|stop|restart}"
+    exit 1
+    ;;
+esac
+exit 0
