@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fb.h>
 #include <linux/input.h>
 #include <poll.h>
 #include <signal.h>
@@ -225,6 +226,89 @@ static void fb_size_now(int *w, int *h)
             *w = *h = 0;
         fclose(fp);
     }
+}
+
+/* --------------------------- 屏幕模式(分辨率) --------------------------- */
+/*
+ * 插上 HDMI 时内核的 sii902x 驱动会读电视 EDID, 然后直接 fb_set_var() 把 fb0
+ * 改成电视的分辨率(实测 1024x600 -> 1280x720)。麻烦在于 LCD 面板是固定的
+ * 1024x600、一个物理像素对一个数据像素、不会自己缩放: 拿一路 1280x720 的信号
+ * 它只能按自己的时序去采, 采不到的地方就变成黑边(实测左边约 1/5 黑)。
+ *
+ * HDMI 和 LCD 共用同一个 fb0, 分辨率只能二选一, 所以给一个策略开关:
+ *   IPTV_SCREEN=lcd   (默认) 改回面板原生 1024x600 —— LCD 正常, 电视自己缩放
+ *   IPTV_SCREEN=hdmi        用电视的 1280x720 —— 电视最清晰, 代价是 LCD 有黑边
+ */
+typedef struct {
+    const char *name;
+    int w, h, bpp;
+    int pixclock;          /* ps */
+    int lm, rm;            /* 水平后肩 / 前肩 */
+    int um, bm;            /* 垂直后肩 / 前肩 */
+    int hs, vs;            /* 同步脉宽 */
+} fb_mode;
+
+/*
+ * LCD 面板时序来自设备树 display#1/display-timings/timing0_1024x768
+ * (名字写着 768, 实测 hactive=1024 vactive=600, clock=50MHz -> 58.59Hz)。
+ * 这组数是面板厂给的, 必须照抄 —— 换成别的时序面板就认不出信号。
+ */
+static const fb_mode MODE_LCD = {
+    "LCD 1024x600", 1024, 600, 32, 20000, 140, 160, 20, 12, 20, 3
+};
+
+/* HDMI 电视: CEA-861 标准 1280x720@60 */
+static const fb_mode MODE_HDMI = {
+    "HDMI 1280x720", 1280, 720, 32, 13468, 220, 110, 20, 5, 40, 5
+};
+
+static const fb_mode *screen_mode(void)
+{
+    const char *s = getenv("IPTV_SCREEN");
+
+    if (s && strncmp(s, "hdmi", 4) == 0)
+        return &MODE_HDMI;
+    return &MODE_LCD;
+}
+
+/*
+ * 把 fb0 切到指定模式。返回: 1=已切换  0=本来就是  -1=失败。
+ * 只改必要的字段: red/green/blue 位域和 sync 极性都保留驱动给的
+ * (sync 来自 LCD 设备树的 hsync/vsync-active, 动它画面会反色或抖)。
+ */
+static int fb_set_mode(const fb_mode *m)
+{
+    int fd = open("/dev/fb0", O_RDWR);
+    if (fd < 0)
+        return -1;
+
+    struct fb_var_screeninfo v;
+    if (ioctl(fd, FBIOGET_VSCREENINFO, &v) < 0) {
+        close(fd);
+        return -1;
+    }
+    if (v.xres == m->w && v.yres == m->h && v.bits_per_pixel == m->bpp) {
+        close(fd);
+        return 0;
+    }
+
+    v.xres = v.xres_virtual = m->w;
+    v.yres = v.yres_virtual = m->h;
+    v.xoffset = v.yoffset = 0;
+    v.bits_per_pixel = m->bpp;
+    v.pixclock = m->pixclock;
+    v.left_margin = m->lm;
+    v.right_margin = m->rm;
+    v.upper_margin = m->um;
+    v.lower_margin = m->bm;
+    v.hsync_len = m->hs;
+    v.vsync_len = m->vs;
+    v.vmode = FB_VMODE_NONINTERLACED;
+    v.activate = FB_ACTIVATE_NOW;
+
+    int r = ioctl(fd, FBIOPUT_VSCREENINFO, &v);
+    close(fd);
+    return r < 0 ? -1 : 1;
 }
 
 /* ------------------------------ ffmpeg 调用 ---------------------------- */
@@ -799,6 +883,22 @@ static void on_touch(int x, int y)
 
 int main(int argc, char **argv)
 {
+    /*
+     * --setfb: 只按 IPTV_SCREEN 策略把 fb0 的分辨率改一遍就退出, 不启动播放。
+     * 给开机脚本用 —— 在画开机图之前先改, 否则那张"正在启动"也会画在
+     * 被 HDMI 顶掉的分辨率上(LCD 上同样是歪的)。
+     */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--setfb") == 0) {
+            const fb_mode *m = screen_mode();
+            int r = fb_set_mode(m);
+
+            printf("[iptv] --setfb: %s -> %s\n", m->name,
+                   r > 0 ? "已切换" : (r == 0 ? "无需切换" : "失败"));
+            return r < 0 ? 1 : 0;
+        }
+    }
+
     int opt;
     while ((opt = getopt(argc, argv, "c:t:k:f:w:H:a")) != -1) {
         switch (opt) {
@@ -814,6 +914,21 @@ int main(int argc, char **argv)
                             "[-f 字体] [-w 宽] [-H 高] [-a 开音频]\n", argv[0]);
             return 1;
         }
+    }
+
+    /*
+     * 先把分辨率按 IPTV_SCREEN 策略定下来, 再探测屏幕参数。
+     * 插着 HDMI 开机时内核已经把 fb0 改成 1280x720 了(驱动按电视 EDID 改的),
+     * 不先改回来的话 LCD 上就是左边一条黑边 —— 面板是固定 1024x600 不会缩放。
+     */
+    {
+        const fb_mode *m = screen_mode();
+        int r = fb_set_mode(m);
+
+        if (r > 0)
+            printf("[iptv] 屏幕模式 -> %s\n", m->name);
+        else if (r < 0)
+            printf("[iptv] 屏幕模式设置失败, 沿用当前分辨率\n");
     }
 
     detect_fb();
@@ -917,7 +1032,21 @@ int main(int argc, char **argv)
             }
             fb_size_now(&w, &h);
             if (w > 0 && h > 0 && (w != g_w || h != g_h)) {
-                printf("[iptv] 屏幕变成 %dx%d (原 %dx%d), 重新适配\n", w, h, g_w, g_h);
+                const fb_mode *want = screen_mode();
+
+                printf("[iptv] 屏幕变成 %dx%d (原 %dx%d)", w, h, g_w, g_h);
+                if (w != want->w || h != want->h) {
+                    /*
+                     * 不是我们要的模式 —— 基本就是 HDMI 驱动按电视 EDID 改的
+                     * (运行中插拔也会触发)。按 IPTV_SCREEN 策略改回来。
+                     */
+                    if (fb_set_mode(want) > 0)
+                        printf(" -> 已按策略改回 %s\n", want->name);
+                    else
+                        printf(" -> 改不回 %s, 只能适配当前分辨率\n", want->name);
+                } else {
+                    printf(" -> 重新适配\n");
+                }
                 fflush(stdout);
                 g_w = g_h = 0;      /* detect_fb() 只在为 0 时才重新测 */
                 detect_fb();

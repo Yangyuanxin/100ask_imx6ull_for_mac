@@ -18,6 +18,13 @@ CONF=/etc/iptv/channels.conf
 CERT=/etc/ssl/certs/ca-certificates.crt
 LOG=/var/log/iptv-init.log
 
+# 屏幕优先级 —— HDMI 和 LCD 共用同一个 fb0, 分辨率只能二选一:
+#   lcd  (默认) 改回 LCD 面板原生 1024x600: LCD 没有黑边, 电视自己缩放
+#   hdmi        用电视的 1280x720:          电视最清晰, 但 LCD 左边会有黑边
+# 改这里即可; 也可以临时覆盖: IPTV_SCREEN=hdmi /etc/init.d/S95iptv start
+IPTV_SCREEN=${IPTV_SCREEN:-lcd}
+export IPTV_SCREEN
+
 case "$1" in
 start)
     # 后台跑, start 立即返回, 绝不阻塞 init
@@ -48,6 +55,15 @@ start)
         echo "iptv: 关闭 console 光标 ..."
         echo 0 > /sys/class/graphics/fbcon/cursor_blink 2>/dev/null
         echo 0 > /sys/class/vtconsole/vtcon1/bind 2>/dev/null
+
+        # 插着 HDMI 开机时, 内核 sii902x 驱动会读电视 EDID 并把 fb0 改成
+        # 1280x720; 而 LCD 面板物理只有 1024x600、不会自己缩放, 于是一路
+        # 不匹配的信号让面板采不到左边 —— 表现就是左边约 1/5 黑边。
+        # 所以画开机图之前先按 IPTV_SCREEN 策略把分辨率定下来:
+        #   默认(或 IPTV_SCREEN=lcd)  -> 改回面板原生 1024x600, LCD 正常
+        #   IPTV_SCREEN=hdmi          -> 保留电视的 1280x720(电视最清晰, LCD 会有黑边)
+        echo "iptv: 修正屏幕分辨率 ..."
+        /root/03_iptv --setfb 2>/dev/null
 
         # 开机第一帧: 联网 + 对时要花几十秒, 这期间别让用户对着黑屏。
         # 这里先画一张"正在启动"静态图(ffmpeg 一瞬间就画完),
